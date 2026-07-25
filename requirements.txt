@@ -1,0 +1,4 @@
+web3>=7.14,<8
+python-dotenv>=1.0,<2
+requests>=2.31,<3
+

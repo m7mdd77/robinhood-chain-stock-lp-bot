@@ -1,0 +1,31 @@
+ROBINHOOD MULTI-POOL V4 BOT - KALI
+
+1) Open the extracted folder:
+   cd ~/Desktop/robinhood_multi_pool_v4_bot
+
+2) Create configuration:
+   cp .env.example .env
+   nano .env
+
+3) Create and activate the virtual environment:
+   python3 -m venv venv
+   source venv/bin/activate
+
+4) Install and verify:
+   python3 -m pip install -r requirements.txt
+   python3 -m py_compile pools.py pool_apr.py config.py abis.py blockchain.py notifications.py lp_bot.py
+
+5) Start:
+   python3 lp_bot.py
+
+The startup dynamically loads official Robinhood stock/ETF contracts, finds
+their compatible Uniswap V4 ETH or USDG pools, ranks them by live APR, and asks
+for the pool, symmetric range percentage, and token amounts. LOW TVL is shown
+for pools below $1,000 because their annualized APR can be misleading.
+
+Use Ctrl+C to withdraw the active position and stop.
+
+Every 4 hours, the bot claims LP fees without removing liquidity. It keeps the
+paired-token fee and sells only the exact claimed stock-token fee to native ETH
+when the KyberSwap quote passes the configured safety limits. Unsafe or small
+stock fees are deferred and kept outside LP principal.
