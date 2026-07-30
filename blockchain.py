@@ -24,7 +24,12 @@ UINT128_MAX = 2**128 - 1
 UINT160_MAX = 2**160 - 1
 UINT256_MAX = 2**256 - 1
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
-TRANSFER_TOPIC = Web3.keccak(text="Transfer(address,address,uint256)").hex()
+TRANSFER_TOPIC = (
+    "0x"
+    + Web3.keccak(text="Transfer(address,address,uint256)")
+    .hex()
+    .removeprefix("0x")
+)
 
 rpc_session = requests.Session()
 rpc_session.headers.update({"Connection": "close"})
@@ -155,6 +160,15 @@ def get_token1_per_token0() -> float:
 def get_spot_price() -> float:
     token1_per_token0 = get_token1_per_token0()
     return token1_per_token0 if config.BASE_INDEX == 0 else 1.0 / token1_per_token0
+
+
+def display_range_for_ticks(tick_lower: int, tick_upper: int) -> tuple[float, float]:
+    human_scale = 10 ** (config.TOKEN0_DECIMALS - config.TOKEN1_DECIMALS)
+    token1_per_token0_low = (1.0001**tick_lower) * human_scale
+    token1_per_token0_high = (1.0001**tick_upper) * human_scale
+    if config.BASE_INDEX == 0:
+        return token1_per_token0_low, token1_per_token0_high
+    return 1 / token1_per_token0_high, 1 / token1_per_token0_low
 
 
 def portfolio_value_quote(amount0: float, amount1: float) -> float:
@@ -896,7 +910,11 @@ def _minted_token_id(receipt: Any, manager_address: str) -> int:
     for log in receipt.logs:
         if log.address.lower() != manager_address.lower() or not log.topics:
             continue
-        if log.topics[0].hex().lower() != TRANSFER_TOPIC.lower() or len(log.topics) < 4:
+        if (
+            log.topics[0].hex().removeprefix("0x").lower()
+            != TRANSFER_TOPIC.removeprefix("0x").lower()
+            or len(log.topics) < 4
+        ):
             continue
         from_address = int(log.topics[1].hex(), 16)
         to_address = int(log.topics[2].hex(), 16) & ((1 << 160) - 1)
@@ -1044,3 +1062,52 @@ def read_position(token_id: int) -> PositionSnapshot:
     token1_per_token0 = get_token1_per_token0()
     value_quote = portfolio_value_quote(amount0, amount1)
     return PositionSnapshot(token_id, tick_lower, tick_upper, liquidity, amount0, amount1, value_quote)
+
+
+def find_existing_positions() -> list[PositionSnapshot]:
+    """Find wallet-owned LP NFTs for the currently selected pool."""
+    manager = (
+        config.V3_POSITION_MANAGER
+        if config.POOL_PROTOCOL == "v3"
+        else config.POSITION_MANAGER
+    )
+    latest = int(w3.eth.block_number)
+    scan_blocks = max(1, int(config.POSITION_SCAN_BLOCKS))
+    chunk_size = max(1, int(config.POSITION_SCAN_CHUNK_BLOCKS))
+    start = max(0, latest - scan_blocks)
+    wallet_topic = "0x" + ("0" * 24) + config.WALLET_ADDRESS[2:].lower()
+    token_ids: set[int] = set()
+    logger.info(
+        "Scanning blocks %s..%s for existing %s LP NFTs.",
+        start,
+        latest,
+        config.POOL_PROTOCOL.upper(),
+    )
+    for chunk_start in range(start, latest + 1, chunk_size):
+        chunk_end = min(latest, chunk_start + chunk_size - 1)
+        logs = w3.eth.get_logs(
+            {
+                "address": manager,
+                "fromBlock": chunk_start,
+                "toBlock": chunk_end,
+                "topics": [TRANSFER_TOPIC, None, wallet_topic],
+            }
+        )
+        for event in logs:
+            if len(event["topics"]) >= 4:
+                token_ids.add(int(event["topics"][3].hex(), 16))
+
+    positions: list[PositionSnapshot] = []
+    for token_id in sorted(token_ids, reverse=True):
+        try:
+            position = read_position(token_id)
+        except Exception:
+            continue
+        if position.liquidity > 0:
+            positions.append(position)
+    logger.info(
+        "Existing-position scan found %s active NFT(s) for %s.",
+        len(positions),
+        config.POOL_LABEL,
+    )
+    return positions

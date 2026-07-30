@@ -1,7 +1,8 @@
 ROBINHOOD MULTI-POOL V4 BOT - KALI
 
-1) Open the extracted folder:
-   cd ~/Desktop/robinhood_multi_pool_v4_bot
+1) Download and open the repository:
+   git clone https://github.com/m7mdd77/robinhood-chain-stock-lp-bot.git
+   cd robinhood-chain-stock-lp-bot
 
 2) Create configuration:
    cp .env.example .env
@@ -13,7 +14,9 @@ ROBINHOOD MULTI-POOL V4 BOT - KALI
 
 4) Install and verify:
    python3 -m pip install -r requirements.txt
-   python3 -m py_compile pools.py pool_apr.py config.py abis.py blockchain.py notifications.py lp_bot.py
+   python3 -m py_compile pools.py pool_apr.py config.py abis.py blockchain.py notifications.py lp_bot.py diagnose.py check_pool_catalog.py
+   python3 check_pool_catalog.py
+   python3 diagnose.py
 
 5) Start:
    python3 lp_bot.py
@@ -22,6 +25,8 @@ The startup dynamically loads official Robinhood stock/ETF contracts, finds
 their compatible Uniswap V4 ETH or USDG pools, ranks them by live APR, and asks
 for the pool, symmetric range percentage, and token amounts. LOW TVL is shown
 for pools below $1,000 because their annualized APR can be misleading.
+Before asking for token amounts, it scans the selected position manager and
+automatically resumes an active wallet-owned LP NFT for that pool.
 
 Use Ctrl+C to withdraw the active position and stop.
 

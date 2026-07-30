@@ -8,6 +8,9 @@ import time
 from typing import Any, Iterable
 import urllib.request
 
+from eth_abi import encode
+from web3 import Web3
+
 
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 WETH_ADDRESS = "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73"
@@ -35,6 +38,33 @@ class PoolConfig:
     base_index: int = 0
     # Token whose claimed LP fees should be converted to native ETH.
     stock_index: int = 0
+
+
+def computed_v4_pool_id(pool: PoolConfig) -> str:
+    encoded_key = encode(
+        ["address", "address", "uint24", "int24", "address"],
+        [
+            Web3.to_checksum_address(pool.currency0),
+            Web3.to_checksum_address(pool.currency1),
+            int(pool.fee),
+            int(pool.tick_spacing),
+            Web3.to_checksum_address(pool.hooks),
+        ],
+    )
+    return "0x" + Web3.keccak(encoded_key).hex().removeprefix("0x").lower()
+
+
+def validate_pool(pool: PoolConfig) -> None:
+    if pool.protocol.lower() == "v3":
+        Web3.to_checksum_address(pool.pool_id)
+        return
+    if int(pool.currency0, 16) >= int(pool.currency1, 16):
+        raise ValueError("V4 currencies are not in canonical address order")
+    computed = computed_v4_pool_id(pool)
+    if computed != pool.pool_id.lower():
+        raise ValueError(
+            f"V4 pool key mismatch: computed {computed}, expected {pool.pool_id.lower()}"
+        )
 
 
 # These explicitly requested pools remain pinned even if a different fee tier
@@ -254,6 +284,7 @@ def _discover_pools(timeout_seconds: float) -> dict[str, PoolConfig]:
 
     selected: list[PoolConfig] = list(PINNED_POOLS.values())
     used_ids: set[str] = {pool.pool_id.lower() for pool in selected}
+    invalid_discovered = 0
     for asset in sorted(assets, key=lambda value: value["symbol"]):
         symbol = asset["symbol"]
         available = candidates.get(symbol) or []
@@ -275,44 +306,66 @@ def _discover_pools(timeout_seconds: float) -> dict[str, PoolConfig]:
                 f"{token0['symbol']} / {token1['symbol']} "
                 f"{fee / 10_000:.2f}% ({protocol.upper()})"
             )
-            selected.append(
-                PoolConfig(
-                    choice=choice,
-                    label=label,
-                    pool_id=pool_id,
-                    currency0=address0,
-                    currency1=address1,
-                    symbol0=token0["symbol"],
-                    symbol1=token1["symbol"],
-                    decimals0=int(token0["decimals"]),
-                    decimals1=int(token1["decimals"]),
-                    fee=fee,
-                    tick_spacing=int(
-                        pool.get("tickSpacing")
-                        or {100: 1, 500: 10, 3000: 60, 10000: 200}.get(fee, 1)
-                    ),
-                    protocol=protocol,
-                    base_index=(
-                        0
-                        if token0["symbol"] in {"ETH", "WETH"}
-                        else 1
-                        if token1["symbol"] in {"ETH", "WETH"}
-                        else stock_index
-                    ),
-                    stock_index=stock_index,
-                )
+            candidate = PoolConfig(
+                choice=choice,
+                label=label,
+                pool_id=pool_id,
+                currency0=address0,
+                currency1=address1,
+                symbol0=token0["symbol"],
+                symbol1=token1["symbol"],
+                decimals0=int(token0["decimals"]),
+                decimals1=int(token1["decimals"]),
+                fee=fee,
+                tick_spacing=int(
+                    pool.get("tickSpacing")
+                    or {100: 1, 500: 10, 3000: 60, 10000: 200}.get(fee, 1)
+                ),
+                protocol=protocol,
+                base_index=(
+                    0
+                    if token0["symbol"] in {"ETH", "WETH"}
+                    else 1
+                    if token1["symbol"] in {"ETH", "WETH"}
+                    else stock_index
+                ),
+                stock_index=stock_index,
             )
+            try:
+                validate_pool(candidate)
+            except ValueError:
+                invalid_discovered += 1
+                continue
+            selected.append(candidate)
             used_ids.add(pool_id)
 
+    if invalid_discovered:
+        print(
+            f"Skipped {invalid_discovered} incompatible Uniswap V4 pool "
+            "candidate(s) with noncanonical pool keys."
+        )
     return {pool.choice: pool for pool in selected}
 
 
 def _load_cache(cache_path: Path) -> dict[str, PoolConfig]:
     payload = json.loads(cache_path.read_text(encoding="utf-8"))
-    return {
-        item["choice"]: PoolConfig(**item)
-        for item in payload.get("pools") or []
-    }
+    valid: dict[str, PoolConfig] = {}
+    rejected = 0
+    for item in payload.get("pools") or []:
+        pool = PoolConfig(**item)
+        try:
+            validate_pool(pool)
+        except (TypeError, ValueError) as exc:
+            rejected += 1
+            print(f"Skipping invalid cached pool {pool.pool_id}: {exc}")
+            continue
+        valid[pool.choice] = pool
+    if rejected:
+        noun = "entry" if rejected == 1 else "entries"
+        print(
+            f"Rejected {rejected} pool catalog {noun} with invalid on-chain identifiers."
+        )
+    return valid
 
 
 def _save_cache(cache_path: Path, pools: dict[str, PoolConfig]) -> None:
@@ -325,6 +378,24 @@ def _save_cache(cache_path: Path, pools: dict[str, PoolConfig]) -> None:
     temporary.replace(cache_path)
 
 
+def _merge_catalogs(
+    cached: dict[str, PoolConfig],
+    discovered: dict[str, PoolConfig],
+) -> dict[str, PoolConfig]:
+    """Keep verified cached pools while adding or updating live discoveries."""
+    by_id = {pool.pool_id.lower(): pool for pool in cached.values()}
+    for pool in discovered.values():
+        by_id[pool.pool_id.lower()] = pool
+    merged: dict[str, PoolConfig] = {}
+    for pool in by_id.values():
+        choice = pool.choice
+        if choice in merged and merged[choice].pool_id.lower() != pool.pool_id.lower():
+            choice = f"{choice}-{pool.pool_id[-6:]}"
+            pool = PoolConfig(**{**asdict(pool), "choice": choice})
+        merged[choice] = pool
+    return merged
+
+
 def load_pools() -> dict[str, PoolConfig]:
     cache_path = Path(
         os.getenv(
@@ -332,7 +403,7 @@ def load_pools() -> dict[str, PoolConfig]:
             str(Path(__file__).with_name("robinhood_pool_catalog.json")),
         )
     )
-    refresh_hours = float(os.getenv("ROBINHOOD_POOL_CATALOG_REFRESH_HOURS", "6"))
+    refresh_hours = float(os.getenv("ROBINHOOD_POOL_CATALOG_REFRESH_HOURS", "0"))
     timeout_seconds = float(os.getenv("ROBINHOOD_POOL_CATALOG_TIMEOUT_SECONDS", "20"))
     cached: dict[str, PoolConfig] = {}
     if cache_path.exists():
@@ -347,12 +418,14 @@ def load_pools() -> dict[str, PoolConfig]:
         discovered = _discover_pools(timeout_seconds)
         if not discovered:
             raise RuntimeError("no compatible official stock pools were discovered")
-        _save_cache(cache_path, discovered)
+        merged = _merge_catalogs(cached, discovered)
+        _save_cache(cache_path, merged)
         print(
-            f"Loaded {len(discovered)} official Robinhood stock pools from "
-            "Robinhood and Uniswap."
+            f"Loaded {len(merged)} compatible Robinhood stock pools "
+            f"({len(discovered)} found live, {len(merged) - len(discovered)} "
+            "retained from the verified catalog)."
         )
-        return discovered
+        return merged
     except Exception as exc:
         if cached:
             print(f"Pool catalog refresh failed ({exc}); using cached catalog.")

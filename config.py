@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -26,19 +27,59 @@ def _address(value: str) -> str:
     return Web3.to_checksum_address(value)
 
 
+def _pool_reference(value: str) -> str:
+    match = re.search(r"0x[a-fA-F0-9]{40,64}", value)
+    return match.group(0).lower() if match else value.strip().lower()
+
+
+def _matching_pools(value: str):
+    reference = _pool_reference(value)
+    exact = [
+        pool
+        for key, pool in POOLS.items()
+        if reference in {
+            key.lower(),
+            pool.choice.lower(),
+            pool.pool_id.lower(),
+            pool.label.lower(),
+        }
+    ]
+    if exact:
+        return exact
+    words = [word for word in re.split(r"[\s/_-]+", reference) if word]
+    return [
+        pool
+        for pool in POOLS.values()
+        if all(
+            word
+            in " ".join(
+                (
+                    pool.label,
+                    pool.symbol0,
+                    pool.symbol1,
+                    pool.protocol,
+                    pool.pool_id,
+                )
+            ).lower()
+            for word in words
+        )
+    ]
+
+
 def _select_pool():
     configured = os.getenv("POOL_CHOICE", "").strip()
     if configured:
-        configured_lower = configured.lower()
-        for key, pool in POOLS.items():
-            if configured_lower in {
-                key.lower(),
-                pool.pool_id.lower(),
-                pool.label.lower(),
-            }:
-                return pool
+        matches = _matching_pools(configured)
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            labels = ", ".join(pool.label for pool in matches[:8])
+            raise ValueError(
+                f"POOL_CHOICE is ambiguous ({labels}). Use the full pool ID."
+            )
         raise ValueError(
-            "POOL_CHOICE must match a catalog key, pool ID, or full pool label"
+            "POOL_CHOICE was not found in the catalog. Run "
+            "python3 refresh_pool_catalog.py or use a current pool ID."
         )
     if not sys.stdin.isatty():
         return POOLS.get("1") or next(iter(POOLS.values()))
@@ -74,14 +115,26 @@ def _select_pool():
         print(f"{rank}) {pool.label} | {format_pool_apr(apr)}{tvl}{low_tvl}")
         print(f"   Pool ID: {pool.pool_id}")
     while True:
-        choice = input(f"Choose pool number (1-{len(ranked_pools)}): ").strip()
+        choice = input(
+            f"Choose number (1-{len(ranked_pools)}), ticker, pool ID, "
+            "or Uniswap pool URL: "
+        ).strip()
         try:
             selected_rank = int(choice)
         except ValueError:
             selected_rank = 0
         if 1 <= selected_rank <= len(ranked_pools):
             return ranked_pools[selected_rank - 1]
-        print(f"Please type a number from 1 to {len(ranked_pools)}.")
+        matches = _matching_pools(choice)
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            print(f"{len(matches)} pools match {choice!r}:")
+            for pool in matches[:20]:
+                print(f"  {pool.label} | {pool.pool_id}")
+            print("Paste the exact pool ID or full Uniswap URL to select one.")
+            continue
+        print("No matching pool. Try its ticker, exact pool ID, or Uniswap URL.")
 
 
 def _select_range() -> float:
@@ -194,6 +247,16 @@ FEE_CLAIM_HOURS = float(os.getenv("FEE_CLAIM_HOURS", "4"))
 SELL_STOCK_FEES_TO_ETH = os.getenv("SELL_STOCK_FEES_TO_ETH", "true").lower() in {"1", "true", "yes", "y"}
 MIN_STOCK_FEE_SELL_USD = float(os.getenv("MIN_STOCK_FEE_SELL_USD", "1"))
 WITHDRAW_ON_CTRL_C = os.getenv("WITHDRAW_ON_CTRL_C", "true").lower() in {"1", "true", "yes", "y"}
+SCAN_EXISTING_POSITIONS = os.getenv("SCAN_EXISTING_POSITIONS", "true").lower() in {
+    "1",
+    "true",
+    "yes",
+    "y",
+}
+POSITION_SCAN_BLOCKS = int(os.getenv("POSITION_SCAN_BLOCKS", "5000000"))
+POSITION_SCAN_CHUNK_BLOCKS = int(
+    os.getenv("POSITION_SCAN_CHUNK_BLOCKS", "50000")
+)
 
 STATE_FILE = Path(__file__).with_name(
     os.getenv("STATE_FILE", f"bot_state_pool_{ACTIVE_POOL.choice}.json")

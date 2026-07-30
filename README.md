@@ -17,7 +17,13 @@ range to use.
   default; both safety filters are configurable in `.env`.
 - Shows each pool's latest available APR and TVL.
 - Sorts selectable pools from highest APR to lowest APR.
+- Accepts a menu number, ticker, exact pool ID, or full Uniswap pool URL.
+- Refreshes live discovery at startup and merges it with the verified bundled
+  catalog, so a partial API response cannot erase previously working pools.
 - Asks for the range percentage at every interactive startup.
+- Scans the selected pool's position manager before any deposit prompt. A
+  wallet-owned active LP NFT is resumed even when the local state file is
+  missing.
 - Uses the same percentage above and below the current market price.
 - Checks the position every 10 minutes.
 - Uses no rebalance buffer.
@@ -126,6 +132,7 @@ Do not force-close the terminal while the withdrawal transaction is pending.
 - `config.py`: startup pool/range selection and environment settings.
 - `blockchain.py`: balances, routing, swaps, minting, claims and withdrawals.
 - `lp_bot.py`: startup prompts, state, reports and rebalance loop.
+- `check_pool_catalog.py`: verifies all cached V3 addresses and V4 pool keys.
 - `notifications.py`: optional Telegram reports.
 - `diagnose.py`: read-only environment and pool diagnostics.
 - `.env.example`: safe configuration template.
@@ -134,14 +141,15 @@ Do not force-close the terminal while the withdrawal transaction is pending.
 ## Kali installation
 
 ```bash
-unzip robinhood_multi_pool_v4_bot_final.zip
-cd robinhood_multi_pool_v4_bot_final
+git clone https://github.com/m7mdd77/robinhood-chain-stock-lp-bot.git
+cd robinhood-chain-stock-lp-bot
 cp .env.example .env
 nano .env
 python3 -m venv venv
 source venv/bin/activate
 python3 -m pip install -r requirements.txt
-python3 -m py_compile pools.py pool_apr.py config.py abis.py blockchain.py notifications.py lp_bot.py diagnose.py
+python3 -m py_compile pools.py pool_apr.py config.py abis.py blockchain.py notifications.py lp_bot.py diagnose.py check_pool_catalog.py
+python3 check_pool_catalog.py
 python3 -m unittest test_strategy_math.py test_uniswap_router_211_encoding.py
 python3 lp_bot.py
 ```

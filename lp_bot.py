@@ -145,6 +145,54 @@ def initial_deposit() -> None:
     open_position("initial", amount0, amount1)
 
 
+def resume_discovered_position() -> bool:
+    if not config.SCAN_EXISTING_POSITIONS:
+        return False
+    positions = _read_with_retry(
+        "existing LP position scan",
+        bc.find_existing_positions,
+        attempts=3,
+        delay_seconds=5,
+    )
+    if not positions:
+        return False
+    position = positions[0]
+    low, high = bc.display_range_for_ticks(
+        position.tick_lower,
+        position.tick_upper,
+    )
+    if len(positions) > 1:
+        logger.warning(
+            "Found %s active positions for the selected pool; resuming newest "
+            "token_id=%s. Other positions are left untouched.",
+            len(positions),
+            position.token_id,
+        )
+    state.token_id = position.token_id
+    state.range_low = low
+    state.range_high = high
+    state.out_anchor_price = 0
+    state.out_direction = ""
+    if not state.starting_value:
+        state.starting_value = position.value_quote
+    if not state.opened_iso:
+        state.opened_iso = datetime.now(timezone.utc).isoformat()
+    save_state()
+    logger.info(
+        "Resuming discovered position token_id=%s, range=[%.8f, %.8f].",
+        position.token_id,
+        low,
+        high,
+    )
+    notifications.send(
+        "Robinhood LP existing position resumed\n"
+        f"Pool: {config.POOL_LABEL}\n"
+        f"Token ID: {position.token_id}\n"
+        f"Range: {low:.8f} - {high:.8f}"
+    )
+    return True
+
+
 def _fee_claim_due() -> bool:
     reference = state.last_fee_claim_iso or state.opened_iso
     if not reference:
@@ -346,6 +394,8 @@ def main() -> None:
             logger.warning("Saved position is unavailable: %s", exc)
             state.token_id = 0
             save_state()
+    if not state.token_id:
+        resume_discovered_position()
     if not state.token_id:
         initial_deposit()
     monitor()
