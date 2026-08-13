@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
+import time
 from typing import Any, Iterable
 
 from web3 import Web3
@@ -38,29 +39,61 @@ def _signed_int24(value: int) -> int:
 
 
 def _get_logs_split(w3: Web3, params: dict[str, Any]) -> list[Any]:
-    try:
-        return list(w3.eth.get_logs(params))
-    except Exception as exc:
-        start = int(params["fromBlock"])
-        end = int(params["toBlock"])
-        message = str(exc).lower()
-        range_error = any(
-            marker in message
-            for marker in (
-                "block range",
-                "range is too large",
-                "response size",
-                "query returned more than",
-                "limit exceeded",
-                "too many results",
+    start = int(params["fromBlock"])
+    end = int(params["toBlock"])
+    last_error: Exception | None = None
+    split_required = False
+    for attempt in range(1, 4):
+        try:
+            return list(w3.eth.get_logs(params))
+        except Exception as exc:
+            last_error = exc
+            message = str(exc).lower()
+            range_error = any(
+                marker in message
+                for marker in (
+                    "block range",
+                    "range is too large",
+                    "response size",
+                    "query returned more than",
+                    "limit exceeded",
+                    "too many results",
+                )
             )
-        )
-        if not range_error or start >= end:
-            raise
-        midpoint = (start + end) // 2
-        left = dict(params, fromBlock=start, toBlock=midpoint)
-        right = dict(params, fromBlock=midpoint + 1, toBlock=end)
-        return _get_logs_split(w3, left) + _get_logs_split(w3, right)
+            transient = any(
+                marker in message
+                for marker in (
+                    "i/o timeout",
+                    "timed out",
+                    "timeout",
+                    "connection reset",
+                    "connection aborted",
+                    "bad gateway",
+                    "502",
+                    "503",
+                    "504",
+                )
+            )
+            if range_error:
+                split_required = True
+                break
+            if not transient:
+                raise
+            if attempt < 3:
+                time.sleep(attempt * 2)
+            else:
+                split_required = True
+    if not split_required or start >= end:
+        assert last_error is not None
+        raise last_error
+    midpoint = (start + end) // 2
+    print(
+        f"RPC log query {start}..{end} timed out or exceeded limits; "
+        f"splitting into {start}..{midpoint} and {midpoint + 1}..{end}."
+    )
+    left = dict(params, fromBlock=start, toBlock=midpoint)
+    right = dict(params, fromBlock=midpoint + 1, toBlock=end)
+    return _get_logs_split(w3, left) + _get_logs_split(w3, right)
 
 
 def _received_token_ids(
@@ -234,7 +267,18 @@ def scan_and_print_before_selection(
             chunk_blocks=int(os.getenv("POSITION_SCAN_CHUNK_BLOCKS", "50000")),
         )
     except Exception as exc:
-        print(f"Existing-position scan unavailable ({exc}). Continuing to pool selection.")
+        if os.getenv("REQUIRE_EXISTING_POSITION_SCAN", "true").lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+        }:
+            raise RuntimeError(
+                "Required existing-position scan failed after adaptive RPC retries. "
+                "The bot stopped before pool selection to avoid opening a duplicate LP. "
+                f"RPC detail: {exc}"
+            ) from exc
+        print(f"Existing-position scan unavailable ({exc}). Continuing because REQUIRE_EXISTING_POSITION_SCAN=false.")
         return ()
     if not positions:
         print("No active wallet-owned Uniswap LP NFT matched the supported pool catalog.")

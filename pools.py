@@ -382,10 +382,8 @@ def _merge_catalogs(
     cached: dict[str, PoolConfig],
     discovered: dict[str, PoolConfig],
 ) -> dict[str, PoolConfig]:
-    """Keep verified cached pools while adding or updating live discoveries."""
-    by_id = {pool.pool_id.lower(): pool for pool in cached.values()}
-    for pool in discovered.values():
-        by_id[pool.pool_id.lower()] = pool
+    """Use successful live discovery as authoritative; cache is fallback only."""
+    by_id = {pool.pool_id.lower(): pool for pool in discovered.values()}
     merged: dict[str, PoolConfig] = {}
     for pool in by_id.values():
         choice = pool.choice

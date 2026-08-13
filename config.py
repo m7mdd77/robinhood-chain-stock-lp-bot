@@ -230,6 +230,9 @@ REBALANCE_BUFFER_PERCENT = 0.0
 SLIPPAGE_PERCENT = float(os.getenv("SLIPPAGE_PERCENT", "0.01"))
 MAX_PRICE_IMPACT_PERCENT = float(os.getenv("MAX_PRICE_IMPACT_PERCENT", "0.05"))
 LP_MINT_TOLERANCE_PERCENT = float(os.getenv("LP_MINT_TOLERANCE_PERCENT", "0.20"))
+LP_WITHDRAW_TOLERANCE_PERCENT = float(
+    os.getenv("LP_WITHDRAW_TOLERANCE_PERCENT", "0.50")
+)
 MIN_SWAP_VALUE_QUOTE = float(os.getenv("MIN_SWAP_VALUE_QUOTE", "1"))
 MIN_SWAP_VALUE_ETH = float(os.getenv("MIN_SWAP_VALUE_ETH", "0.0005"))
 # Never let an environment override reduce the wallet below the requested gas
@@ -240,6 +243,10 @@ USDG_ADDRESS = _address(
 )
 USDG_DECIMALS = 6
 SWAP_RETRY_SECONDS = int(os.getenv("SWAP_RETRY_SECONDS", "15"))
+MAX_SWAP_ATTEMPTS = int(os.getenv("MAX_SWAP_ATTEMPTS", "8"))
+MAX_OPEN_ATTEMPTS = int(os.getenv("MAX_OPEN_ATTEMPTS", "8"))
+RECEIPT_READ_ATTEMPTS = int(os.getenv("RECEIPT_READ_ATTEMPTS", "6"))
+RECEIPT_RETRY_SECONDS = int(os.getenv("RECEIPT_RETRY_SECONDS", "5"))
 TX_DEADLINE_SECONDS = int(os.getenv("TX_DEADLINE_SECONDS", "180"))
 HTTP_TIMEOUT_SECONDS = int(os.getenv("HTTP_TIMEOUT_SECONDS", "25"))
 
@@ -256,6 +263,15 @@ KYBER_BUILD_URL = os.getenv(
 ).strip()
 KYBER_CLIENT_ID = os.getenv("KYBER_CLIENT_ID", "robinhood-multi-pool-v4-bot").strip()
 KYBER_NATIVE_ADDRESS = _address("0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE")
+KYBER_ALLOWED_HOST = "aggregator-api.kyberswap.com"
+KYBER_ALLOWED_ROUTERS = tuple(
+    _address(item.strip())
+    for item in os.getenv(
+        "KYBER_ALLOWED_ROUTERS",
+        "0x6131B5fae19EA4f9D964eAc0408E4408b66337b5",
+    ).split(",")
+    if item.strip()
+)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -290,6 +306,14 @@ if not 0 <= MAX_PRICE_IMPACT_PERCENT <= 10:
     raise ValueError("MAX_PRICE_IMPACT_PERCENT must be between 0 and 10")
 if not 0 < LP_MINT_TOLERANCE_PERCENT <= 5:
     raise ValueError("LP_MINT_TOLERANCE_PERCENT must be greater than 0 and at most 5")
+if not 0 < LP_WITHDRAW_TOLERANCE_PERCENT <= 5:
+    raise ValueError("LP_WITHDRAW_TOLERANCE_PERCENT must be greater than 0 and at most 5")
+if MAX_SWAP_ATTEMPTS <= 0 or MAX_OPEN_ATTEMPTS <= 0:
+    raise ValueError("MAX_SWAP_ATTEMPTS and MAX_OPEN_ATTEMPTS must be greater than 0")
+if RECEIPT_READ_ATTEMPTS <= 0 or RECEIPT_RETRY_SECONDS < 0:
+    raise ValueError("Receipt retry settings are invalid")
+if not KYBER_ALLOWED_ROUTERS:
+    raise ValueError("KYBER_ALLOWED_ROUTERS must contain at least one audited router")
 if FEE_CLAIM_HOURS <= 0:
     raise ValueError("FEE_CLAIM_HOURS must be greater than 0")
 if MIN_STOCK_FEE_SELL_USD < 0:

@@ -60,6 +60,19 @@ POOL_KEY = (
     config.TICK_SPACING,
     config.HOOK_ADDRESS,
 )
+_CONFIRMED_RECEIPTS: dict[str, Any] = {}
+
+
+class UnsafeToRetryError(RuntimeError):
+    """A transaction may already be final; automatic rebroadcast is unsafe."""
+
+
+class TransactionStatusUnknown(UnsafeToRetryError):
+    pass
+
+
+class ConfirmedTransactionInvariantError(UnsafeToRetryError):
+    pass
 
 
 @dataclass
@@ -95,6 +108,63 @@ def _base_tx() -> dict[str, Any]:
     }
 
 
+def _confirmed_receipt(tx_hash: Any, tx_hex: str) -> Any:
+    last_error: Exception | None = None
+    for attempt in range(1, config.RECEIPT_READ_ATTEMPTS + 1):
+        try:
+            receipt = w3.eth.wait_for_transaction_receipt(
+                tx_hash,
+                timeout=30,
+                poll_latency=2,
+            )
+            if receipt.status != 1:
+                raise RuntimeError(f"TX reverted: {tx_hex}")
+            logger.info("TX confirmed in block %s", receipt.blockNumber)
+            _CONFIRMED_RECEIPTS[tx_hex.lower()] = receipt
+            return receipt
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            last_error = exc
+            if attempt < config.RECEIPT_READ_ATTEMPTS:
+                logger.warning(
+                    "Receipt read failed for %s (%s/%s): %s. Retrying in %ss.",
+                    tx_hex,
+                    attempt,
+                    config.RECEIPT_READ_ATTEMPTS,
+                    exc,
+                    config.RECEIPT_RETRY_SECONDS,
+                )
+                time.sleep(config.RECEIPT_RETRY_SECONDS)
+    raise TransactionStatusUnknown(
+        f"Transaction {tx_hex} was broadcast, but its final status is unknown; "
+        "automatic retry is disabled. Check the explorer before restarting. "
+        f"Last receipt error: {last_error}"
+    )
+
+
+def _broadcast_signed(signed: Any) -> tuple[Any, str]:
+    raw = _raw_signed_transaction(signed)
+    local_hash = Web3.keccak(raw)
+    tx_hex = "0x" + local_hash.hex().removeprefix("0x")
+    try:
+        tx_hash = w3.eth.send_raw_transaction(raw)
+    except Exception as exc:
+        try:
+            receipt = w3.eth.get_transaction_receipt(local_hash)
+        except Exception:
+            raise TransactionStatusUnknown(
+                f"Broadcast result for {tx_hex} is unknown ({exc}); automatic retry is disabled. "
+                "Check the explorer and pending nonce before restarting."
+            ) from exc
+        if receipt.status != 1:
+            raise RuntimeError(f"TX reverted: {tx_hex}") from exc
+        _CONFIRMED_RECEIPTS[tx_hex.lower()] = receipt
+        logger.info("TX confirmed in block %s", receipt.blockNumber)
+        return local_hash, tx_hex
+    return tx_hash, tx_hex
+
+
 def send_function(fn: Any, *, value: int = 0) -> str:
     base = _base_tx()
     args = {"from": config.WALLET_ADDRESS, "value": value}
@@ -104,14 +174,20 @@ def send_function(fn: Any, *, value: int = 0) -> str:
         raise RuntimeError(f"Gas estimate failed; refusing likely-reverting transaction: {exc}") from exc
     tx = fn.build_transaction({**base, "value": value, "gas": int(estimate * config.GAS_LIMIT_MULTIPLIER)})
     signed = account.sign_transaction(tx)
-    tx_hash = w3.eth.send_raw_transaction(_raw_signed_transaction(signed))
-    tx_hex = "0x" + tx_hash.hex().removeprefix("0x")
+    tx_hash, tx_hex = _broadcast_signed(signed)
     logger.info("TX sent: %s", tx_hex)
-    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
-    if receipt.status != 1:
-        raise RuntimeError(f"TX reverted: {tx_hex}")
-    logger.info("TX confirmed in block %s", receipt.blockNumber)
+    _confirmed_receipt(tx_hash, tx_hex)
     return tx_hex
+
+
+def _receipt_for_confirmed_hash(tx_hash: str) -> Any:
+    receipt = _CONFIRMED_RECEIPTS.get(tx_hash.lower())
+    if receipt is None:
+        raise ConfirmedTransactionInvariantError(
+            f"Confirmed transaction receipt for {tx_hash} is unavailable in this process; "
+            "refusing to repeat the transaction."
+        )
+    return receipt
 
 
 def verify_pool() -> None:
@@ -218,6 +294,29 @@ def balances() -> tuple[float, float, float]:
     return raw0 / 10**config.TOKEN0_DECIMALS, raw1 / 10**config.TOKEN1_DECIMALS, native
 
 
+def _balances_after_confirmed(label: str) -> tuple[float, float, float]:
+    last_error: Exception | None = None
+    for attempt in range(1, config.RECEIPT_READ_ATTEMPTS + 1):
+        try:
+            return balances()
+        except Exception as exc:
+            last_error = exc
+            if attempt < config.RECEIPT_READ_ATTEMPTS:
+                logger.warning(
+                    "%s confirmed, but balance read failed (%s/%s): %s. Retrying in %ss.",
+                    label,
+                    attempt,
+                    config.RECEIPT_READ_ATTEMPTS,
+                    exc,
+                    config.RECEIPT_RETRY_SECONDS,
+                )
+                time.sleep(config.RECEIPT_RETRY_SECONDS)
+    raise ConfirmedTransactionInvariantError(
+        f"{label} confirmed, but wallet balances could not be verified: {last_error}. "
+        "Stop automatic retries and rescan the wallet/position before continuing."
+    )
+
+
 def ticks_for_range(spot: float) -> tuple[int, int, float, float]:
     low_price = spot * (1 - config.RANGE_DOWN_PERCENT / 100)
     high_price = spot * (1 + config.RANGE_UP_PERCENT / 100)
@@ -276,10 +375,14 @@ def amounts_for_liquidity(liquidity: int, tick_lower: int, tick_upper: int) -> t
 def _approve_erc20(contract: Any, spender: str, amount: int) -> None:
     if contract is None:
         return
-    if contract.functions.allowance(config.WALLET_ADDRESS, spender).call() >= amount:
+    allowance = int(contract.functions.allowance(config.WALLET_ADDRESS, spender).call())
+    if allowance == amount:
         return
-    logger.info("Approving token %s for %s", contract.address, spender)
-    send_function(contract.functions.approve(spender, UINT256_MAX))
+    if allowance:
+        logger.info("Resetting token %s allowance for %s", contract.address, spender)
+        send_function(contract.functions.approve(spender, 0))
+    logger.info("Approving exact token amount for %s", spender)
+    send_function(contract.functions.approve(spender, amount))
 
 
 def _approve_permit2(contract: Any, spender: str, amount: int) -> None:
@@ -287,10 +390,11 @@ def _approve_permit2(contract: Any, spender: str, amount: int) -> None:
         return
     _approve_erc20(contract, config.PERMIT2, amount)
     allowed, expiration, _ = permit2.functions.allowance(config.WALLET_ADDRESS, contract.address, spender).call()
-    if int(allowed) >= amount and int(expiration) > int(time.time()) + 3600:
+    if int(allowed) >= amount and int(expiration) > int(time.time()) + config.TX_DEADLINE_SECONDS:
         return
-    logger.info("Setting Permit2 allowance for %s to %s", contract.address, spender)
-    send_function(permit2.functions.approve(contract.address, spender, UINT160_MAX, 2**48 - 1))
+    expiration = int(time.time()) + max(3600, config.TX_DEADLINE_SECONDS * 2)
+    logger.info("Setting exact, short-lived Permit2 allowance for %s to %s", contract.address, spender)
+    send_function(permit2.functions.approve(contract.address, spender, amount, expiration))
 
 
 def _impact_percent(
@@ -351,6 +455,11 @@ def _uniswap_quote(token_in: str, amount_in_raw: int, token1_per_token0: float) 
 
 
 def _http_json(url: str, *, method: str = "GET", payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != "https" or parsed.hostname != config.KYBER_ALLOWED_HOST:
+        raise RuntimeError(
+            f"Refusing route API outside audited HTTPS host {config.KYBER_ALLOWED_HOST}: {url}"
+        )
     headers = {
         "Accept": "application/json",
         "Content-Type": "application/json",
@@ -479,11 +588,9 @@ def _kyber_stock_to_eth_route(amount_in_raw: int) -> dict[str, Any]:
     if not amount_out or amount_in_usd <= 0 or amount_out_usd <= 0:
         raise RuntimeError("Kyber stock-to-ETH quote is missing output or USD valuation")
 
-    # Kyber's USD difference includes the source pool's known LP fee. Remove
-    # that fee before enforcing the separate price-impact guard.
-    known_fee_percent = config.POOL_FEE / 10_000
-    expected_after_fee = amount_in_usd * (1 - known_fee_percent / 100)
-    impact = max(0.0, (expected_after_fee - amount_out_usd) / expected_after_fee * 100)
+    # This route may cross pools unrelated to the selected LP. Enforce the
+    # complete quoted USD loss instead of subtracting the selected pool fee.
+    impact = max(0.0, (amount_in_usd - amount_out_usd) / amount_in_usd * 100)
     return {
         "provider": "kyberswap",
         "amount_out": amount_out,
@@ -605,11 +712,9 @@ def _execute_api_transaction(route: dict[str, Any], token_in: str, amount_in_raw
     except Exception as exc:
         raise RuntimeError(f"{route['provider']} transaction estimate failed: {exc}") from exc
     signed = account.sign_transaction(raw_tx)
-    tx_hash = w3.eth.send_raw_transaction(_raw_signed_transaction(signed))
-    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
-    if receipt.status != 1:
-        raise RuntimeError(f"{route['provider']} transaction reverted: {tx_hash.hex()}")
-    return receipt
+    tx_hash, tx_hex = _broadcast_signed(signed)
+    logger.info("TX sent: %s", tx_hex)
+    return _confirmed_receipt(tx_hash, tx_hex)
 
 
 def _execute_kyber(route: dict[str, Any], token_in: str, amount_in_raw: int) -> Any:
@@ -631,9 +736,14 @@ def _execute_kyber(route: dict[str, Any], token_in: str, amount_in_raw: int) -> 
     data = built.get("data")
     if not target or not data:
         raise RuntimeError("Kyber build response has no routerAddress/calldata")
+    allowed_routers = {address.lower() for address in config.KYBER_ALLOWED_ROUTERS}
+    if str(target).lower() not in allowed_routers:
+        raise RuntimeError(f"Kyber returned unapproved router {target}")
     expected_router = route.get("router_address")
     if expected_router and target.lower() != str(expected_router).lower():
         raise RuntimeError("Kyber build router differs from the quoted router")
+    if expected_router and str(expected_router).lower() not in allowed_routers:
+        raise RuntimeError(f"Kyber quote returned unapproved router {expected_router}")
     built_amount_in = _find_int(built, ("amountIn",))
     if built_amount_in and built_amount_in != amount_in_raw:
         raise RuntimeError("Kyber build amountIn differs from the quoted amount")
@@ -669,7 +779,8 @@ def convert_startup_funding(token_in: str, token_out: str, amount_in: float) -> 
     if amount_in_raw <= 0:
         raise RuntimeError("Selected startup funding amount is zero")
 
-    while True:
+    last_error: Exception | None = None
+    for attempt in range(1, config.MAX_SWAP_ATTEMPTS + 1):
         try:
             route = _kyber_funding_route(token_in, token_out, amount_in_raw)
             if route["impact"] > config.MAX_PRICE_IMPACT_PERCENT:
@@ -685,7 +796,14 @@ def convert_startup_funding(token_in: str, token_out: str, amount_in: float) -> 
             )
             before = _raw_balance(token_out)
             receipt = _execute_kyber(route, token_in, amount_in_raw)
-            after = _raw_balance(token_out)
+            try:
+                after = _raw_balance(token_out)
+            except Exception as exc:
+                logger.warning(
+                    "Startup funding confirmed, but output balance read failed; using validated quote without rebroadcast: %s",
+                    exc,
+                )
+                return route["amount_out"] / 10**output_decimals
             received_raw = max(0, after - before)
             if token_out.lower() == ZERO_ADDRESS:
                 gas_price = int(getattr(receipt, "effectiveGasPrice", 0) or receipt.get("effectiveGasPrice", 0))
@@ -699,20 +817,31 @@ def convert_startup_funding(token_in: str, token_out: str, amount_in: float) -> 
             return received
         except KeyboardInterrupt:
             raise
+        except UnsafeToRetryError:
+            raise
         except Exception as exc:
+            last_error = exc
+            if attempt >= config.MAX_SWAP_ATTEMPTS:
+                break
             logger.warning(
-                "Startup funding swap not safe/ready: %s. Retrying in %ss.",
+                "Startup funding swap not safe/ready (%s/%s): %s. Retrying in %ss.",
+                attempt,
+                config.MAX_SWAP_ATTEMPTS,
                 exc,
                 config.SWAP_RETRY_SECONDS,
             )
             time.sleep(config.SWAP_RETRY_SECONDS)
+    raise RuntimeError(
+        f"Startup funding swap failed after {config.MAX_SWAP_ATTEMPTS} attempts: {last_error}"
+    )
 
 
 def execute_swap(token_in: str, token_out: str, amount_in: float) -> tuple[str, float, float]:
     input_decimals = config.TOKEN0_DECIMALS if token_in.lower() == config.TOKEN0_ADDRESS.lower() else config.TOKEN1_DECIMALS
     output_decimals = config.TOKEN0_DECIMALS if token_out.lower() == config.TOKEN0_ADDRESS.lower() else config.TOKEN1_DECIMALS
     amount_in_raw = int(amount_in * 10**input_decimals)
-    while True:
+    last_error: Exception | None = None
+    for attempt in range(1, config.MAX_SWAP_ATTEMPTS + 1):
         try:
             token1_per_token0 = get_token1_per_token0()
             routes, quote_errors = safe_routes(token_in, token_out, amount_in_raw, token1_per_token0)
@@ -727,20 +856,53 @@ def execute_swap(token_in: str, token_out: str, amount_in: float) -> tuple[str, 
                         _execute_kyber(route, token_in, amount_in_raw)
                     else:
                         _execute_api_transaction(route, token_in, amount_in_raw)
-                    after = _raw_balance(token_out)
+                    after = None
+                    balance_error: Exception | None = None
+                    for read_attempt in range(1, config.RECEIPT_READ_ATTEMPTS + 1):
+                        try:
+                            after = _raw_balance(token_out)
+                            break
+                        except Exception as exc:
+                            balance_error = exc
+                            if read_attempt < config.RECEIPT_READ_ATTEMPTS:
+                                time.sleep(config.RECEIPT_RETRY_SECONDS)
+                    if after is None:
+                        logger.warning(
+                            "Swap confirmed, but output balance reads failed; using the validated quote and never rebroadcasting. Error: %s",
+                            balance_error,
+                        )
+                        received = route["amount_out"] / 10**output_decimals
+                        return route["provider"], amount_in, received
                     received = max(0, after - before) / 10**output_decimals
                     if received <= 0:
-                        raise RuntimeError("confirmed swap produced no output-token balance increase")
+                        raise ConfirmedTransactionInvariantError(
+                            "Swap transaction confirmed but no output-token balance increase was observed. "
+                            "Automatic rebroadcast is disabled; inspect the transaction and wallet balances."
+                        )
                     return route["provider"], amount_in, received
+                except UnsafeToRetryError:
+                    raise
                 except Exception as exc:
                     execution_errors.append(f"{route['provider']}: {exc}")
                     logger.warning("Route %s failed; trying next safe route: %s", route["provider"], exc)
             raise RuntimeError(" | ".join(quote_errors + execution_errors) or "no safe routes")
         except KeyboardInterrupt:
             raise
+        except UnsafeToRetryError:
+            raise
         except Exception as exc:
-            logger.warning("Swap not safe/ready: %s. Retrying in %ss.", exc, config.SWAP_RETRY_SECONDS)
+            last_error = exc
+            if attempt >= config.MAX_SWAP_ATTEMPTS:
+                break
+            logger.warning(
+                "Swap not safe/ready (%s/%s): %s. Retrying in %ss.",
+                attempt,
+                config.MAX_SWAP_ATTEMPTS,
+                exc,
+                config.SWAP_RETRY_SECONDS,
+            )
             time.sleep(config.SWAP_RETRY_SECONDS)
+    raise RuntimeError(f"Swap failed after {config.MAX_SWAP_ATTEMPTS} attempts: {last_error}")
 
 
 def sell_stock_fees_to_eth(amount: float) -> tuple[float, float, float]:
@@ -863,10 +1025,13 @@ def mint_position(amount0: float, amount1: float) -> tuple[int, float, float]:
             int(time.time()) + config.TX_DEADLINE_SECONDS,
         )
         tx_hash = send_function(v3_position_manager.functions.mint(params))
-        receipt = w3.eth.get_transaction_receipt(tx_hash)
+        receipt = _receipt_for_confirmed_hash(tx_hash)
         token_id = _minted_token_id(receipt, config.V3_POSITION_MANAGER)
         if not token_id:
-            raise RuntimeError("Mint confirmed, but the new V3 position token ID was not found")
+            raise ConfirmedTransactionInvariantError(
+                "Mint confirmed, but the new V3 position token ID was not found. "
+                "Automatic remint is disabled; scan wallet positions before restarting."
+            )
         logger.info(
             "V3 position minted: token_id=%s, range=[%.8f, %.8f] %s per %s",
             token_id,
@@ -905,10 +1070,13 @@ def mint_position(amount0: float, amount1: float) -> tuple[int, float, float]:
         position_manager.functions.modifyLiquidities(unlock_data, int(time.time()) + config.TX_DEADLINE_SECONDS),
         value=native_value,
     )
-    receipt = w3.eth.get_transaction_receipt(tx_hash)
+    receipt = _receipt_for_confirmed_hash(tx_hash)
     token_id = _minted_token_id(receipt, config.POSITION_MANAGER)
     if not token_id:
-        raise RuntimeError("Mint confirmed, but the new V4 position token ID was not found")
+        raise ConfirmedTransactionInvariantError(
+            "Mint confirmed, but the new V4 position token ID was not found. "
+            "Automatic remint is disabled; scan wallet positions before restarting."
+        )
     logger.info("Position minted: token_id=%s, range=[%.8f, %.8f] %s per %s", token_id, actual_low, actual_high, config.TOKEN0_SYMBOL, config.TOKEN1_SYMBOL)
     return token_id, actual_low, actual_high
 
@@ -932,6 +1100,15 @@ def _minted_token_id(receipt: Any, manager_address: str) -> int:
 
 def burn_position(token_id: int) -> tuple[float, float]:
     before0, before1, _ = balances()
+    snapshot = read_position(token_id)
+    expected0, expected1 = amounts_for_liquidity(
+        snapshot.liquidity,
+        snapshot.tick_lower,
+        snapshot.tick_upper,
+    )
+    tolerance = 1 - config.LP_WITHDRAW_TOLERANCE_PERCENT / 100
+    min0 = int(expected0 * 10**config.TOKEN0_DECIMALS * tolerance)
+    min1 = int(expected1 * 10**config.TOKEN1_DECIMALS * tolerance)
     if config.POOL_PROTOCOL == "v3":
         position = v3_position_manager.functions.positions(token_id).call()
         liquidity = int(position[7])
@@ -941,8 +1118,8 @@ def burn_position(token_id: int) -> tuple[float, float]:
                     (
                         token_id,
                         liquidity,
-                        0,
-                        0,
+                        min0,
+                        min1,
                         int(time.time()) + config.TX_DEADLINE_SECONDS,
                     )
                 )
@@ -952,16 +1129,19 @@ def burn_position(token_id: int) -> tuple[float, float]:
                 (token_id, config.WALLET_ADDRESS, UINT128_MAX, UINT128_MAX)
             )
         )
-        after0, after1, _ = balances()
+        after0, after1, _ = _balances_after_confirmed("V3 withdrawal")
         return max(0, after0 - before0), max(0, after1 - before1)
-    burn_params = encode(["uint256", "uint128", "uint128", "bytes"], [token_id, 0, 0, b""])
+    burn_params = encode(
+        ["uint256", "uint128", "uint128", "bytes"],
+        [token_id, min0, min1, b""],
+    )
     take_params = encode(
         ["address", "address", "address"],
         [config.TOKEN0_ADDRESS, config.TOKEN1_ADDRESS, config.WALLET_ADDRESS],
     )
     unlock_data = encode(["bytes", "bytes[]"], [bytes([0x03, 0x11]), [burn_params, take_params]])
     send_function(position_manager.functions.modifyLiquidities(unlock_data, int(time.time()) + config.TX_DEADLINE_SECONDS))
-    after0, after1, _ = balances()
+    after0, after1, _ = _balances_after_confirmed("V4 withdrawal")
     return max(0, after0 - before0), max(0, after1 - before1)
 
 
@@ -990,7 +1170,7 @@ def collect_fees(token_id: int) -> tuple[float, float]:
                 (token_id, config.WALLET_ADDRESS, UINT128_MAX, UINT128_MAX)
             )
         )
-        after0, after1, _ = balances()
+        after0, after1, _ = _balances_after_confirmed("V3 fee claim")
         fee0 = max(0, after0 - before0)
         fee1 = max(0, after1 - before1)
         logger.info(
@@ -1016,7 +1196,7 @@ def collect_fees(token_id: int) -> tuple[float, float]:
             int(time.time()) + config.TX_DEADLINE_SECONDS,
         )
     )
-    after0, after1, _ = balances()
+    after0, after1, _ = _balances_after_confirmed("V4 fee claim")
     fee0 = max(0, after0 - before0)
     fee1 = max(0, after1 - before1)
     logger.info(
@@ -1058,15 +1238,29 @@ def read_position(token_id: int) -> PositionSnapshot:
     owner = position_manager.functions.ownerOf(token_id).call()
     if owner.lower() != config.WALLET_ADDRESS.lower():
         raise RuntimeError(f"Position {token_id} is owned by {owner}")
-    _, packed = position_manager.functions.getPoolAndPositionInfo(token_id).call()
+    pool_key, packed = position_manager.functions.getPoolAndPositionInfo(token_id).call()
+    returned_key = (
+        str(pool_key[0]).lower(),
+        str(pool_key[1]).lower(),
+        int(pool_key[2]),
+        int(pool_key[3]),
+        str(pool_key[4]).lower(),
+    )
+    expected_key = (
+        str(POOL_KEY[0]).lower(),
+        str(POOL_KEY[1]).lower(),
+        int(POOL_KEY[2]),
+        int(POOL_KEY[3]),
+        str(POOL_KEY[4]).lower(),
+    )
+    if returned_key != expected_key:
+        raise RuntimeError(f"V4 position {token_id} belongs to a different pool")
     tick_lower = ((int(packed) >> 8) & 0xFFFFFF)
     tick_upper = ((int(packed) >> 32) & 0xFFFFFF)
     tick_lower = tick_lower - (1 << 24) if tick_lower & (1 << 23) else tick_lower
     tick_upper = tick_upper - (1 << 24) if tick_upper & (1 << 23) else tick_upper
     liquidity = int(position_manager.functions.getPositionLiquidity(token_id).call())
     amount0, amount1 = amounts_for_liquidity(liquidity, tick_lower, tick_upper)
-    spot = get_spot_price()
-    token1_per_token0 = get_token1_per_token0()
     value_quote = portfolio_value_quote(amount0, amount1)
     return PositionSnapshot(token_id, tick_lower, tick_upper, liquidity, amount0, amount1, value_quote)
 
@@ -1122,35 +1316,71 @@ def find_existing_positions() -> list[PositionSnapshot]:
 
 def _get_logs_with_range_splitting(filter_params: dict[str, Any]) -> list[Any]:
     """Read logs while adapting to RPC providers with small block-range limits."""
-    try:
-        return list(w3.eth.get_logs(filter_params))
-    except Exception as exc:
-        start = int(filter_params["fromBlock"])
-        end = int(filter_params["toBlock"])
-        message = str(exc).lower()
-        range_error = any(
-            marker in message
-            for marker in (
-                "block range",
-                "range is too large",
-                "response size",
-                "query returned more than",
-                "limit exceeded",
-                "too many results",
+    start = int(filter_params["fromBlock"])
+    end = int(filter_params["toBlock"])
+    last_error: Exception | None = None
+    split_required = False
+    for attempt in range(1, 4):
+        try:
+            return list(w3.eth.get_logs(filter_params))
+        except Exception as exc:
+            last_error = exc
+            message = str(exc).lower()
+            range_error = any(
+                marker in message
+                for marker in (
+                    "block range",
+                    "range is too large",
+                    "response size",
+                    "query returned more than",
+                    "limit exceeded",
+                    "too many results",
+                )
             )
-        )
-        if not range_error or start >= end:
-            raise
-        midpoint = (start + end) // 2
-        logger.info(
-            "RPC rejected log range %s..%s; retrying as %s..%s and %s..%s.",
-            start,
-            end,
-            start,
-            midpoint,
-            midpoint + 1,
-            end,
-        )
-        left = dict(filter_params, fromBlock=start, toBlock=midpoint)
-        right = dict(filter_params, fromBlock=midpoint + 1, toBlock=end)
-        return _get_logs_with_range_splitting(left) + _get_logs_with_range_splitting(right)
+            transient = any(
+                marker in message
+                for marker in (
+                    "i/o timeout",
+                    "timed out",
+                    "timeout",
+                    "connection reset",
+                    "connection aborted",
+                    "bad gateway",
+                    "502",
+                    "503",
+                    "504",
+                )
+            )
+            if range_error:
+                split_required = True
+                break
+            if not transient:
+                raise
+            if attempt < 3:
+                logger.warning(
+                    "RPC log query %s..%s failed (%s/3): %s. Retrying in %ss.",
+                    start,
+                    end,
+                    attempt,
+                    exc,
+                    attempt * 2,
+                )
+                time.sleep(attempt * 2)
+            else:
+                split_required = True
+    if not split_required or start >= end:
+        assert last_error is not None
+        raise last_error
+    midpoint = (start + end) // 2
+    logger.info(
+        "RPC log query %s..%s timed out or exceeded limits; retrying as %s..%s and %s..%s.",
+        start,
+        end,
+        start,
+        midpoint,
+        midpoint + 1,
+        end,
+    )
+    left = dict(filter_params, fromBlock=start, toBlock=midpoint)
+    right = dict(filter_params, fromBlock=midpoint + 1, toBlock=end)
+    return _get_logs_with_range_splitting(left) + _get_logs_with_range_splitting(right)

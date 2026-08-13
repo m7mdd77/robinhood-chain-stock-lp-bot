@@ -51,7 +51,9 @@ state = load_state()
 
 
 def save_state() -> None:
-    config.STATE_FILE.write_text(json.dumps(asdict(state), indent=2), encoding="utf-8")
+    temporary = config.STATE_FILE.with_suffix(config.STATE_FILE.suffix + ".tmp")
+    temporary.write_text(json.dumps(asdict(state), indent=2), encoding="utf-8")
+    temporary.replace(config.STATE_FILE)
 
 
 def ask_amount(label: str, maximum: float) -> float:
@@ -69,7 +71,8 @@ def ask_amount(label: str, maximum: float) -> float:
 def open_position(context: str, amount0: float, amount1: float) -> None:
     global state
     attempt = 0
-    while True:
+    last_error: Exception | None = None
+    while attempt < config.MAX_OPEN_ATTEMPTS:
         attempt += 1
         try:
             live0, live1, _ = bc.balances()
@@ -94,11 +97,19 @@ def open_position(context: str, amount0: float, amount1: float) -> None:
             return
         except KeyboardInterrupt:
             raise
+        except bc.UnsafeToRetryError:
+            raise
         except Exception as exc:
+            last_error = exc
             logger.error("[%s] Open attempt %s failed: %s. Retrying in 15s.", context, attempt, exc)
             notifications.send(f"Robinhood LP {context} deposit retry\n{exc}")
+            if attempt >= config.MAX_OPEN_ATTEMPTS:
+                break
             time.sleep(config.SWAP_RETRY_SECONDS)
             amount0, amount1, _ = bc.balances()
+    raise RuntimeError(
+        f"{context} position open failed after {config.MAX_OPEN_ATTEMPTS} attempts: {last_error}"
+    )
 
 
 def initial_deposit() -> None:
@@ -250,6 +261,8 @@ def claim_fees_and_convert(context: str) -> None:
                 f"to {received_eth:.8f} ETH"
             )
             logger.info("%s fee conversion: %s", context, sale_line)
+        except bc.UnsafeToRetryError:
+            raise
         except Exception as exc:
             logger.warning(
                 "%s stock-fee conversion deferred; tracked fees remain outside LP principal: %s",
@@ -271,6 +284,8 @@ def rebalance() -> None:
     logger.warning("=== REBALANCE TRIGGERED ===")
     try:
         claim_fees_and_convert("pre-rebalance")
+    except bc.UnsafeToRetryError:
+        raise
     except Exception as exc:
         logger.warning("Pre-rebalance fee claim failed; continuing with principal rebalance: %s", exc)
     withdrawn0, withdrawn1 = bc.burn_position(state.token_id)
@@ -310,6 +325,12 @@ def _read_with_retry(label: str, read_fn, attempts: int = 3, delay_seconds: int 
         try:
             return read_fn()
         except KeyboardInterrupt:
+            raise
+        except bc.UnsafeToRetryError:
+            notifications.send(
+                "Robinhood LP stopped for manual transaction verification\n"
+                "A transaction may already be confirmed. Check the explorer and wallet before restarting."
+            )
             raise
         except Exception as exc:
             if attempt >= attempts:
@@ -381,6 +402,13 @@ def monitor() -> None:
                 next_report = time.time() + config.STATUS_REPORT_HOURS * 3600
         except KeyboardInterrupt:
             raise
+        except bc.UnsafeToRetryError as exc:
+            logger.critical("Automatic operation stopped for manual transaction verification: %s", exc)
+            notifications.send(
+                "Robinhood LP stopped for manual transaction verification\n"
+                f"{exc}"
+            )
+            raise
         except Exception as exc:
             logger.error("Main loop error after read retries: %s. Retrying in 60s.", exc)
             notifications.send(f"Robinhood LP temporary error\n{exc}\nRetrying automatically.")
@@ -441,6 +469,8 @@ if __name__ == "__main__":
             try:
                 try:
                     claim_fees_and_convert("Ctrl+C")
+                except bc.UnsafeToRetryError:
+                    raise
                 except Exception as exc:
                     logger.warning("Ctrl+C fee claim/conversion failed; continuing with withdrawal: %s", exc)
                 logger.info("Ctrl+C safety: withdrawing position %s.", state.token_id)
