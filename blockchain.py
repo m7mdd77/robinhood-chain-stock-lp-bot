@@ -892,7 +892,14 @@ def mint_position(amount0: float, amount1: float) -> tuple[int, float, float]:
         [POOL_KEY, tick_lower, tick_upper, liquidity, raw0, raw1, config.WALLET_ADDRESS, b""],
     )
     settle_params = encode(["address", "address"], [config.TOKEN0_ADDRESS, config.TOKEN1_ADDRESS])
-    unlock_data = encode(["bytes", "bytes[]"], [bytes([0x02, 0x0D]), [mint_params, settle_params]])
+    actions = bytes([0x02, 0x0D])
+    action_params = [mint_params, settle_params]
+    if config.HAS_NATIVE0 or config.HAS_NATIVE1:
+        # SETTLE_PAIR pays only the ETH actually used by the position. Return
+        # the unused msg.value so a later PositionManager call cannot spend it.
+        actions += bytes([0x14])
+        action_params.append(encode(["address", "address"], [ZERO_ADDRESS, config.WALLET_ADDRESS]))
+    unlock_data = encode(["bytes", "bytes[]"], [actions, action_params])
     native_value = raw0 if config.HAS_NATIVE0 else raw1 if config.HAS_NATIVE1 else 0
     tx_hash = send_function(
         position_manager.functions.modifyLiquidities(unlock_data, int(time.time()) + config.TX_DEADLINE_SECONDS),

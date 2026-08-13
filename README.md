@@ -133,6 +133,8 @@ Do not force-close the terminal while the withdrawal transaction is pending.
 - `blockchain.py`: balances, routing, swaps, minting, claims and withdrawals.
 - `lp_bot.py`: startup prompts, state, reports and rebalance loop.
 - `check_pool_catalog.py`: verifies all cached V3 addresses and V4 pool keys.
+- `apply_robinhood_100plus_stock_pool_update.py`: refreshes and validates the
+  expanded official stock/ETF pool catalog while retaining a local backup.
 - `notifications.py`: optional Telegram reports.
 - `diagnose.py`: read-only environment and pool diagnostics.
 - `.env.example`: safe configuration template.
@@ -148,7 +150,7 @@ nano .env
 python3 -m venv venv
 source venv/bin/activate
 python3 -m pip install -r requirements.txt
-python3 -m py_compile pools.py pool_apr.py config.py abis.py blockchain.py notifications.py lp_bot.py diagnose.py check_pool_catalog.py
+python3 -m py_compile pools.py pool_apr.py config.py abis.py blockchain.py notifications.py lp_bot.py diagnose.py check_pool_catalog.py apply_robinhood_100plus_stock_pool_update.py
 python3 check_pool_catalog.py
 python3 -m unittest test_strategy_math.py test_uniswap_router_211_encoding.py
 python3 lp_bot.py
