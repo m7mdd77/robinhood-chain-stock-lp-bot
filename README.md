@@ -17,13 +17,15 @@ range to use.
   default; both safety filters are configurable in `.env`.
 - Shows each pool's latest available APR and TVL.
 - Sorts selectable pools from highest APR to lowest APR.
+- Before showing the pool menu, scans both Uniswap V3 and V4 position managers
+  and displays every active wallet-owned LP NFT matched to the full catalog.
+- Marks matching menu entries with `EXISTING NFT #...`.
 - Accepts a menu number, ticker, exact pool ID, or full Uniswap pool URL.
 - Refreshes live discovery at startup and merges it with the verified bundled
   catalog, so a partial API response cannot erase previously working pools.
 - Asks for the range percentage at every interactive startup.
-- Scans the selected pool's position manager before any deposit prompt. A
-  wallet-owned active LP NFT is resumed even when the local state file is
-  missing.
+- After selection, verifies the chosen pool again before any deposit prompt. A
+  wallet-owned active LP NFT is resumed even when the local state file is missing.
 - Uses the same percentage above and below the current market price.
 - Checks the position every 10 minutes.
 - Uses no rebalance buffer.
@@ -150,7 +152,7 @@ nano .env
 python3 -m venv venv
 source venv/bin/activate
 python3 -m pip install -r requirements.txt
-python3 -m py_compile pools.py pool_apr.py config.py abis.py blockchain.py notifications.py lp_bot.py diagnose.py check_pool_catalog.py apply_robinhood_100plus_stock_pool_update.py
+python3 -m py_compile pools.py pool_apr.py startup_positions.py config.py abis.py blockchain.py notifications.py lp_bot.py diagnose.py check_pool_catalog.py apply_robinhood_100plus_stock_pool_update.py
 python3 check_pool_catalog.py
 python3 -m unittest test_strategy_math.py test_uniswap_router_211_encoding.py
 python3 lp_bot.py

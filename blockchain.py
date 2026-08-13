@@ -1092,7 +1092,7 @@ def find_existing_positions() -> list[PositionSnapshot]:
     )
     for chunk_start in range(start, latest + 1, chunk_size):
         chunk_end = min(latest, chunk_start + chunk_size - 1)
-        logs = w3.eth.get_logs(
+        logs = _get_logs_with_range_splitting(
             {
                 "address": manager,
                 "fromBlock": chunk_start,
@@ -1118,3 +1118,39 @@ def find_existing_positions() -> list[PositionSnapshot]:
         config.POOL_LABEL,
     )
     return positions
+
+
+def _get_logs_with_range_splitting(filter_params: dict[str, Any]) -> list[Any]:
+    """Read logs while adapting to RPC providers with small block-range limits."""
+    try:
+        return list(w3.eth.get_logs(filter_params))
+    except Exception as exc:
+        start = int(filter_params["fromBlock"])
+        end = int(filter_params["toBlock"])
+        message = str(exc).lower()
+        range_error = any(
+            marker in message
+            for marker in (
+                "block range",
+                "range is too large",
+                "response size",
+                "query returned more than",
+                "limit exceeded",
+                "too many results",
+            )
+        )
+        if not range_error or start >= end:
+            raise
+        midpoint = (start + end) // 2
+        logger.info(
+            "RPC rejected log range %s..%s; retrying as %s..%s and %s..%s.",
+            start,
+            end,
+            start,
+            midpoint,
+            midpoint + 1,
+            end,
+        )
+        left = dict(filter_params, fromBlock=start, toBlock=midpoint)
+        right = dict(filter_params, fromBlock=midpoint + 1, toBlock=end)
+        return _get_logs_with_range_splitting(left) + _get_logs_with_range_splitting(right)

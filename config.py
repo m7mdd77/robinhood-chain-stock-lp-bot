@@ -10,10 +10,18 @@ from web3 import Web3
 
 from pool_apr import fetch_pool_aprs, format_pool_apr
 from pools import ZERO_ADDRESS, load_pools
+from startup_positions import scan_and_print_before_selection
 
 
 load_dotenv(Path(__file__).with_name(".env"))
 POOLS = load_pools()
+EXISTING_POSITIONS = scan_and_print_before_selection(POOLS.values())
+EXISTING_POSITIONS_BY_POOL = {
+    position.pool_choice: tuple(
+        item for item in EXISTING_POSITIONS if item.pool_choice == position.pool_choice
+    )
+    for position in EXISTING_POSITIONS
+}
 
 
 def _required(name: str) -> str:
@@ -112,7 +120,16 @@ def _select_pool():
         apr = pool_aprs.get(pool.choice)
         tvl = f" | TVL ${apr.tvl_usd:,.2f}" if apr is not None else ""
         low_tvl = " | LOW TVL" if apr is not None and apr.tvl_usd < 1_000 else ""
-        print(f"{rank}) {pool.label} | {format_pool_apr(apr)}{tvl}{low_tvl}")
+        existing = EXISTING_POSITIONS_BY_POOL.get(pool.choice, ())
+        existing_note = (
+            " | EXISTING " + ", ".join(f"NFT #{item.token_id}" for item in existing)
+            if existing
+            else ""
+        )
+        print(
+            f"{rank}) {pool.label} | {format_pool_apr(apr)}{tvl}{low_tvl}"
+            f"{existing_note}"
+        )
         print(f"   Pool ID: {pool.pool_id}")
     while True:
         choice = input(

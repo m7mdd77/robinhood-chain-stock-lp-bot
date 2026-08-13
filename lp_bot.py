@@ -147,7 +147,12 @@ def initial_deposit() -> None:
 
 def resume_discovered_position() -> bool:
     if not config.SCAN_EXISTING_POSITIONS:
+        print("\nExisting LP position scan is disabled by configuration.")
         return False
+    print("\n=== Existing LP position scan ===")
+    print(f"Pool          : {config.POOL_LABEL}")
+    print(f"Wallet        : {config.WALLET_ADDRESS}")
+    print("Searching the selected pool before requesting a new deposit...")
     positions = _read_with_retry(
         "existing LP position scan",
         bc.find_existing_positions,
@@ -155,7 +160,25 @@ def resume_discovered_position() -> bool:
         delay_seconds=5,
     )
     if not positions:
+        print("Result        : no active wallet-owned position found for this pool.")
         return False
+    print(f"Result        : {len(positions)} active position(s) found.")
+    for index, discovered in enumerate(positions, start=1):
+        discovered_low, discovered_high = bc.display_range_for_ticks(
+            discovered.tick_lower,
+            discovered.tick_upper,
+        )
+        selected = " [will resume]" if index == 1 else " [left untouched]"
+        print(f"{index}) Token ID {discovered.token_id}{selected}")
+        print(
+            f"   Amounts    : {discovered.amount0:.8f} {config.TOKEN0_SYMBOL} + "
+            f"{discovered.amount1:.8f} {config.TOKEN1_SYMBOL}"
+        )
+        print(
+            f"   Range      : {discovered_low:.8f} - {discovered_high:.8f} "
+            f"{config.QUOTE_SYMBOL} per {config.BASE_SYMBOL}"
+        )
+        print(f"   Est. value : {discovered.value_quote:.4f} {config.QUOTE_SYMBOL}")
     position = positions[0]
     low, high = bc.display_range_for_ticks(
         position.tick_lower,
@@ -386,7 +409,17 @@ def main() -> None:
     )
     logger.info("=" * 68)
 
-    if state.token_id:
+    discovered_position = False
+    try:
+        discovered_position = resume_discovered_position()
+    except Exception as exc:
+        logger.warning(
+            "On-chain existing-position scan failed: %s. Falling back to saved state.",
+            exc,
+        )
+        print(f"Position scan : temporarily unavailable ({exc})")
+
+    if not discovered_position and state.token_id:
         try:
             bc.read_position(state.token_id)
             logger.info("Resuming position token_id=%s", state.token_id)
@@ -394,8 +427,6 @@ def main() -> None:
             logger.warning("Saved position is unavailable: %s", exc)
             state.token_id = 0
             save_state()
-    if not state.token_id:
-        resume_discovered_position()
     if not state.token_id:
         initial_deposit()
     monitor()
