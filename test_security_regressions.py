@@ -88,12 +88,13 @@ class SecurityRegressionTests(unittest.TestCase):
         self.assertIn("(amount_in_usd - amount_out_usd) / amount_in_usd", source)
         self.assertNotIn("known_fee_percent", source)
 
-    def test_retries_are_bounded_and_live_catalog_is_authoritative(self):
+    def test_retries_are_bounded_and_partial_refresh_keeps_verified_catalog(self):
         self.assertIn("MAX_SWAP_ATTEMPTS", function_source(BLOCKCHAIN_SOURCE, "execute_swap"))
         self.assertIn("MAX_OPEN_ATTEMPTS", function_source(LP_BOT_SOURCE, "open_position"))
         merge_source = function_source(POOLS_SOURCE, "_merge_catalogs")
+        self.assertIn("for pool in cached.values()", merge_source)
+        self.assertIn("by_id.update", merge_source)
         self.assertIn("for pool in discovered.values()", merge_source)
-        self.assertNotIn("for pool in cached.values()", merge_source)
 
     def test_public_rpc_position_scans_retry_split_and_fail_closed(self):
         startup_source = (ROOT / "startup_positions.py").read_text(encoding="utf-8")
